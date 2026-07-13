@@ -1,0 +1,38 @@
+services:
+  telegram-bot:
+    build: ./bot
+    container_name: telegram-api-bot
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+    depends_on:
+      - ngrok-gateway
+      - monero-rpc-wallet
+    ports:
+      - "8000:8000"
+
+  ngrok-gateway:
+    image: ngrok/ngrok:latest
+    container_name: ngrok-gateway
+    command: "http telegram-bot:8000"
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    ports:
+      - "4040:4040"
+
+  monero-rpc-wallet:
+    image: normoes/monero:latest
+    container_name: monero-rpc-wallet
+    entrypoint: ""
+    command: >
+      monero-wallet-rpc
+      --stagenet
+      --daemon-address node.sethforprivacy.com:38089
+      --rpc-bind-ip 0.0.0.0
+      --rpc-bind-port 38083
+      --disable-rpc-login
+      --wallet-dir /monero
+      --confirm-external-bind
+    volumes:
+      - ./wallet-data:/monero
+    ports:
+      - "38083:38083"
