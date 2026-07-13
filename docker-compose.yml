@@ -32,6 +32,7 @@ services:
       --disable-rpc-login
       --wallet-dir /monero
       --confirm-external-bind
+      --trusted-daemon
     volumes:
       - ./wallet-data:/monero
     ports:
