@@ -239,6 +239,7 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Por favor ingresa un código válido.")
         return
 
+    # Simular validación del producto (para pruebas)
     if "pantalon" not in product_code:
         await update.message.reply_text(
             "Código de producto no reconocido. Intenta con 'pantalon_XXXX'"
@@ -246,9 +247,11 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        payment_id = secrets.token_hex(8)  # 8 bytes = 16 hex chars
+        # Generar payment_id de 8 bytes (16 caracteres hex)
+        payment_id = secrets.token_hex(8)
         logger.info(f"Generando dirección integrada con payment_id: {payment_id}")
 
+        # Llamar al wallet RPC
         resp = await rpc_call("make_integrated_address", {"payment_id": payment_id})
         if "error" in resp:
             logger.error(f"Error en make_integrated_address: {resp['error']}")
@@ -275,17 +278,28 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         logger.info(f"Pago pendiente agregado para {payment_id}")
 
+        # Formatear monto sin notación científica
+        # Ejemplo: 0.001 -> "0.001", 0.000000000001 -> "0.000000000001"
+        amount_str = f"{PAYMENT_AMOUNT:.12f}".rstrip("0").rstrip(".")
+
+        # Construir mensaje con HTML para mejor visualización
         mensaje = (
-            f"✅ Para completar la compra del producto *{product_code}*:\n\n"
-            f"💰 *Monto a pagar:* `{PAYMENT_AMOUNT}` XMR\n"
-            f"📬 *Dirección de pago:*\n`{integrated_address}`\n\n"
+            f"✅ Para completar la compra del producto <b>{product_code}</b>:\n\n"
+            f"💰 <b>Monto a pagar:</b> <code>{amount_str}</code> XMR\n"
+            f"📬 <b>Dirección de pago:</b>\n"
+            f"<code>{integrated_address}</code>\n\n"
             f"⏳ Una vez realizado el pago, el sistema verificará la transacción automáticamente.\n"
-            f"🔗 *Importante:* Envía exactamente el monto indicado."
+            f"🔗 <b>Importante:</b> Envía exactamente el monto indicado.\n"
+            f"\n💡 <i>Para copiar la dirección o el monto, haz tap largo sobre el texto y selecciona.</i>"
         )
 
+        # Enviar mensaje con parse_mode HTML
         await update.message.reply_text(
-            mensaje, parse_mode=None, disable_web_page_preview=True
+            mensaje,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
+
         logger.info(
             f"Mensaje de pago enviado a usuario {user_id} con address {integrated_address}"
         )
