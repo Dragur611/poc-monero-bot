@@ -22,7 +22,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "TU_TOKEN_AQUI")
 MONERO_RPC_URL = os.getenv("MONERO_RPC_URL", "http://monero-rpc-wallet:38083/json_rpc")
 NGROK_URL = os.getenv("NGROK_URL", "http://ngrok-gateway:4040/api/tunnels")
 
-PAYMENT_AMOUNT = 0.001  # Monto fijo para pruebas en stagenet
+PAYMENT_AMOUNT = 0.000000000001  # XMR
+POLL_INTERVAL = 15  # segundos
 
 # Configurar logging
 logging.basicConfig(
@@ -30,6 +31,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ---------- Estado global ----------
+pending_payments = {}  # payment_id -> {user_id, product_code, amount, address, ...}
+processed_txids = set()  # para no procesar la misma tx dos veces
 
 
 # ---------- Cliente RPC ----------
@@ -58,10 +63,6 @@ async def rpc_call(method: str, params: dict = None) -> dict:
 
 
 async def wait_for_rpc(max_retries: int = 10, delay: float = 2.0) -> bool:
-    """
-    Espera hasta que el wallet RPC esté disponible, haciendo polling con get_balance.
-    Retorna True si se conecta, False si se agotan los reintentos.
-    """
     logger.info("⏳ Esperando que el wallet RPC esté disponible...")
     for attempt in range(1, max_retries + 1):
         try:
@@ -76,14 +77,11 @@ async def wait_for_rpc(max_retries: int = 10, delay: float = 2.0) -> bool:
 
 
 async def init_monero_wallet():
-    """Espera a que el RPC esté listo, luego crea la wallet si no existe, o la abre si ya existe."""
-    # Primero esperar a que el RPC esté accesible
     if not await wait_for_rpc():
         raise RuntimeError("Wallet RPC no disponible")
 
     logger.info("Inicializando wallet Monero...")
     try:
-        # Intentar crear
         resp = await rpc_call(
             "create_wallet",
             {
@@ -93,16 +91,13 @@ async def init_monero_wallet():
             },
         )
         if "error" in resp:
-            logger.info(
-                f"create_wallet returned error (probablemente ya existe): {resp['error']}"
-            )
+            logger.info(f"create_wallet returned error: {resp['error']}")
         else:
             logger.info("Wallet creada exitosamente.")
     except Exception as e:
         logger.warning(f"create_wallet falló: {e}")
 
     try:
-        # Abrir wallet
         resp = await rpc_call(
             "open_wallet",
             {
@@ -113,24 +108,128 @@ async def init_monero_wallet():
         if "error" in resp:
             logger.error(f"open_wallet error: {resp['error']}")
             raise RuntimeError("No se pudo abrir la wallet")
-        else:
-            logger.info("Wallet abierta correctamente.")
+        logger.info("Wallet abierta correctamente.")
     except Exception as e:
         logger.error(f"open_wallet falló: {e}")
         raise
 
 
-# ---------- Funciones del bot ----------
+# ---------- Verificación de pagos ----------
+async def check_payments():
+    """Task en segundo plano que verifica pagos entrantes cada POLL_INTERVAL segundos."""
+    global pending_payments, processed_txids
+
+    while True:
+        try:
+            # Obtener transferencias entrantes (confirmadas y en pool)
+            resp = await rpc_call(
+                "get_transfers",
+                {
+                    "in": True,  # transferencias confirmadas
+                    "pool": True,  # transferencias en el pool (no confirmadas)
+                    "filter_by_height": False,
+                },
+            )
+
+            result = resp.get("result", {})
+            # Combinar listas de transacciones
+            all_txs = []
+            for key in ["in", "pool"]:
+                if key in result and isinstance(result[key], list):
+                    all_txs.extend(result[key])
+
+            if not all_txs:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            # Procesar cada transacción
+            for tx in all_txs:
+                txid = tx.get("txid")
+                if txid in processed_txids:
+                    continue
+
+                payment_id = tx.get("payment_id")
+                if not payment_id:
+                    continue  # sin payment_id, no nos interesa
+
+                # Buscar si este payment_id está en nuestros pendientes
+                if payment_id in pending_payments:
+                    pend = pending_payments[payment_id]
+                    # Verificar monto (en piconeros)
+                    # 1 XMR = 1e12 piconeros
+                    amount_piconero = tx.get("amount", 0)
+                    expected_piconero = int(pend["amount"] * 1e12)
+                    if amount_piconero >= expected_piconero:
+                        # Pago recibido!
+                        logger.info(
+                            f"✅ Pago detectado para usuario {pend['user_id']}, txid: {txid}"
+                        )
+                        # Enviar mensaje de confirmación al usuario
+                        try:
+                            await send_payment_confirmation(
+                                pend["user_id"], pend["product_code"], txid
+                            )
+                        except Exception as e:
+                            logger.error(f"Error al enviar confirmación: {e}")
+                        # Eliminar pendiente
+                        del pending_payments[payment_id]
+                        # Marcar tx como procesada
+                        processed_txids.add(txid)
+                    else:
+                        logger.warning(
+                            f"⚠️ Pago con monto incorrecto para {payment_id}: recibido {amount_piconero}, esperado {expected_piconero}"
+                        )
+
+                # Opcional: marcar tx como procesada aunque no coincida, para no repetir
+                # Pero mejor solo marcar si coincide o si ya no está pendiente.
+                # Si no coincide, no la marcamos, porque podría ser para otro producto futuro.
+                # Sin embargo, si ya fue procesada (coincidió) la marcamos.
+
+            # Limpiar set de txids procesados si crece demasiado
+            if len(processed_txids) > 1000:
+                processed_txids = set(list(processed_txids)[-500:])
+
+        except Exception as e:
+            logger.error(f"Error en check_payments: {e}", exc_info=True)
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def send_payment_confirmation(user_id: int, product_code: str, txid: str):
+    """Envía mensaje de confirmación al usuario."""
+    # Necesitamos una referencia al bot para enviar mensajes.
+    # Usaremos la instancia global de telegram_app.
+    global telegram_app
+    if telegram_app is None:
+        logger.error("Telegram app no disponible para enviar confirmación")
+        return
+
+    try:
+        mensaje = (
+            f"🎉 ¡Pago recibido!\n"
+            f"Producto: *{product_code}*\n"
+            f"ID de transacción: `{txid}`\n\n"
+            f"✅ Tu compra ha sido confirmada. ¡Gracias!"
+        )
+        await telegram_app.bot.send_message(
+            chat_id=user_id, text=mensaje, parse_mode=None
+        )
+        logger.info(f"Confirmación enviada al usuario {user_id}")
+    except Exception as e:
+        logger.error(f"Error enviando confirmación a {user_id}: {e}")
+
+
+# ---------- Handlers del bot ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start"""
+    logger.info(f"Usuario {update.effective_user.id} ejecutó /start")
     await update.message.reply_text(
         "¡Bienvenido! Por favor ingresa el código del producto (ejemplo: pantalon_00432)"
     )
-    logger.info(f"Usuario {update.effective_user.id} inició conversación")
 
 
 async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja el código de producto ingresado por el usuario."""
+    global pending_payments
+
     product_code = update.message.text.strip()
     user_id = update.effective_user.id
 
@@ -140,7 +239,6 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Por favor ingresa un código válido.")
         return
 
-    # Simular que el producto existe (para pruebas)
     if "pantalon" not in product_code:
         await update.message.reply_text(
             "Código de producto no reconocido. Intenta con 'pantalon_XXXX'"
@@ -148,17 +246,14 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # 1. Generar un payment_id aleatorio de 16 bytes en hex (32 caracteres)
-        payment_id = secrets.token_hex(16)
+        payment_id = secrets.token_hex(8)  # 8 bytes = 16 hex chars
         logger.info(f"Generando dirección integrada con payment_id: {payment_id}")
 
-        # 2. Llamar al wallet RPC para obtener una dirección integrada
         resp = await rpc_call("make_integrated_address", {"payment_id": payment_id})
-
         if "error" in resp:
             logger.error(f"Error en make_integrated_address: {resp['error']}")
             await update.message.reply_text(
-                "Hubo un error al generar la dirección de pago. Por favor intenta más tarde."
+                "Hubo un error al generar la dirección de pago."
             )
             return
 
@@ -170,57 +265,57 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 3. Construir mensaje con la dirección y el monto
-        amount_xmr = PAYMENT_AMOUNT
-        mensaje = (
-            f"✅ Para completar la compra del producto *{product_code}*:\n\n"
-            f"💰 *Monto a pagar:* `{amount_xmr}` XMR\n"
-            f"📬 *Dirección de pago:*\n`{integrated_address}`\n\n"
-            f"⏳ Una vez realizado el pago, el sistema verificará la transacción automáticamente.\n"
-            f"🔗 *Importante:* Envía exactamente el monto indicado para evitar problemas."
-        )
-
-        # 4. Guardar el estado en contexto (para futuras verificaciones)
-        context.user_data["pending_payment"] = {
+        # Guardar pago pendiente
+        pending_payments[payment_id] = {
+            "user_id": user_id,
             "product_code": product_code,
-            "payment_id": payment_id,
             "address": integrated_address,
-            "amount": amount_xmr,
+            "amount": PAYMENT_AMOUNT,
             "timestamp": datetime.now().isoformat(),
         }
+        logger.info(f"Pago pendiente agregado para {payment_id}")
 
-        # 5. Enviar mensaje al usuario
-        await update.message.reply_text(
-            mensaje,
-            parse_mode=None,
-            disable_web_page_preview=True,
+        mensaje = (
+            f"✅ Para completar la compra del producto *{product_code}*:\n\n"
+            f"💰 *Monto a pagar:* `{PAYMENT_AMOUNT}` XMR\n"
+            f"📬 *Dirección de pago:*\n`{integrated_address}`\n\n"
+            f"⏳ Una vez realizado el pago, el sistema verificará la transacción automáticamente.\n"
+            f"🔗 *Importante:* Envía exactamente el monto indicado."
         )
 
+        await update.message.reply_text(
+            mensaje, parse_mode=None, disable_web_page_preview=True
+        )
         logger.info(
-            f"Mensaje de pago enviado a usuario {user_id} con dirección {integrated_address}"
+            f"Mensaje de pago enviado a usuario {user_id} con address {integrated_address}"
         )
 
     except Exception as e:
         logger.error(
             f"Error en handle_product para usuario {user_id}: {e}", exc_info=True
         )
-        await update.message.reply_text(
-            "❌ Ocurrió un error al procesar tu solicitud. Por favor intenta más tarde."
-        )
+        await update.message.reply_text("❌ Ocurrió un error al procesar tu solicitud.")
 
 
-# ---------- Configuración de la aplicación FastAPI con lifespan ----------
+# ---------- Crear la aplicación de telegram (global) ----------
+def create_telegram_app() -> Application:
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product))
+    return app
+
+
+telegram_app = None
+
+
+# ---------- FastAPI con lifespan ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Contexto de vida de la aplicación.
-    - Startup: inicializa wallet y configura webhook.
-    - Shutdown: (opcional) tareas de limpieza.
-    """
+    global telegram_app
+
     logger.info("🚀 Iniciando aplicación...")
 
-    # --- STARTUP ---
-    # Inicializar wallet Monero (espera a que el RPC esté listo)
+    # 1. Inicializar wallet
     try:
         await init_monero_wallet()
         logger.info("✅ Wallet Monero inicializada correctamente.")
@@ -228,17 +323,20 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Fallo crítico al iniciar la wallet: {e}")
         raise
 
-    # Configurar webhook
+    # 2. Crear e inicializar la aplicación de telegram
+    telegram_app = create_telegram_app()
+    await telegram_app.initialize()
+    logger.info("✅ Aplicación de Telegram inicializada.")
+
+    # 3. Configurar webhook
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(NGROK_URL)
             tunnels = resp.json().get("tunnels", [])
             if not tunnels:
-                logger.error("No se encontraron túneles ngrok")
                 raise RuntimeError("ngrok no está corriendo")
             public_url = tunnels[0].get("public_url")
             if not public_url:
-                logger.error("No se pudo obtener la URL pública de ngrok")
                 raise RuntimeError("URL pública no encontrada")
 
         webhook_url = f"{public_url}/webhook"
@@ -258,30 +356,40 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Error configurando webhook: {e}")
         raise
 
-    # --- YIELD: la aplicación está activa ---
-    yield
+    # 4. Lanzar task de verificación de pagos
+    asyncio.create_task(check_payments())
+    logger.info(
+        f"🔍 Task de verificación de pagos iniciado (intervalo {POLL_INTERVAL}s)"
+    )
 
-    # --- SHUTDOWN (opcional) ---
+    yield  # La aplicación está activa
+
+    # Shutdown
     logger.info("🛑 Apagando aplicación...")
+    if telegram_app:
+        await telegram_app.shutdown()
 
 
-# ---------- Crear la aplicación FastAPI con lifespan ----------
 app = FastAPI(lifespan=lifespan)
 
 
-# ---------- Endpoint FastAPI para webhook ----------
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Recibe updates de Telegram."""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    await application.initialize()
-    update_data = await request.json()
-    update = Update.de_json(update_data, application.bot)
-    await application.process_update(update)
-    return {"status": "ok"}
+    global telegram_app
+    if telegram_app is None:
+        logger.error("❌ Aplicación de Telegram no inicializada")
+        return {"status": "error", "message": "Not initialized"}
+
+    try:
+        update_data = await request.json()
+        update = Update.de_json(update_data, telegram_app.bot)
+        await telegram_app.process_update(update)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error procesando webhook: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
 
 
-# ---------- Punto de entrada (para ejecución directa) ----------
 if __name__ == "__main__":
     import uvicorn
 
