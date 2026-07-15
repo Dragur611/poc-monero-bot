@@ -4,11 +4,14 @@ services:
     container_name: telegram-api-bot
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - RESPONSE_FILE_ENDPOINT=${RESPONSE_FILE_ENDPOINT}
     depends_on:
       - ngrok-gateway
       - monero-rpc-wallet
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   ngrok-gateway:
     image: ngrok/ngrok:latest

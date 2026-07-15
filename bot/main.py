@@ -21,6 +21,9 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "TU_TOKEN_AQUI")
 MONERO_RPC_URL = os.getenv("MONERO_RPC_URL", "http://monero-rpc-wallet:38083/json_rpc")
 NGROK_URL = os.getenv("NGROK_URL", "http://ngrok-gateway:4040/api/tunnels")
+RESPONSE_FILE_ENDPOINT = os.getenv(
+    "RESPONSE_FILE_ENDPOINT", "http://localhost:8001/scrape"
+)  # Endpoint de generación de facturas
 
 PAYMENT_AMOUNT = 0.000000000001  # XMR
 POLL_INTERVAL = 15  # segundos
@@ -114,6 +117,29 @@ async def init_monero_wallet():
         raise
 
 
+# ---------- Generación de factura ----------
+async def generate_invoice(product_code: str) -> bytes:
+    """
+    Llama al endpoint /scrape para generar el PDF de la factura.
+    Retorna el contenido binario del PDF.
+    """
+    logger.info(f"Generando factura para producto: {product_code}")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(
+                RESPONSE_FILE_ENDPOINT,
+                json={"query": product_code},
+            )
+            response.raise_for_status()
+            # Asumimos que la respuesta es el PDF en binario
+            return response.content
+        except Exception as e:
+            logger.error(
+                f"Error generando factura para {product_code}: {e}", exc_info=True
+            )
+            raise
+
+
 # ---------- Verificación de pagos ----------
 async def check_payments():
     """Task en segundo plano que verifica pagos entrantes cada POLL_INTERVAL segundos."""
@@ -121,18 +147,16 @@ async def check_payments():
 
     while True:
         try:
-            # Obtener transferencias entrantes (confirmadas y en pool)
             resp = await rpc_call(
                 "get_transfers",
                 {
-                    "in": True,  # transferencias confirmadas
-                    "pool": True,  # transferencias en el pool (no confirmadas)
+                    "in": True,
+                    "pool": True,
                     "filter_by_height": False,
                 },
             )
 
             result = resp.get("result", {})
-            # Combinar listas de transacciones
             all_txs = []
             for key in ["in", "pool"]:
                 if key in result and isinstance(result[key], list):
@@ -142,7 +166,6 @@ async def check_payments():
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            # Procesar cada transacción
             for tx in all_txs:
                 txid = tx.get("txid")
                 if txid in processed_txids:
@@ -150,42 +173,27 @@ async def check_payments():
 
                 payment_id = tx.get("payment_id")
                 if not payment_id:
-                    continue  # sin payment_id, no nos interesa
+                    continue
 
-                # Buscar si este payment_id está en nuestros pendientes
                 if payment_id in pending_payments:
                     pend = pending_payments[payment_id]
-                    # Verificar monto (en piconeros)
-                    # 1 XMR = 1e12 piconeros
                     amount_piconero = tx.get("amount", 0)
                     expected_piconero = int(pend["amount"] * 1e12)
                     if amount_piconero >= expected_piconero:
-                        # Pago recibido!
                         logger.info(
                             f"✅ Pago detectado para usuario {pend['user_id']}, txid: {txid}"
                         )
-                        # Enviar mensaje de confirmación al usuario
-                        try:
-                            await send_payment_confirmation(
-                                pend["user_id"], pend["product_code"], txid
-                            )
-                        except Exception as e:
-                            logger.error(f"Error al enviar confirmación: {e}")
-                        # Eliminar pendiente
+                        # Enviar confirmación + factura
+                        await send_payment_confirmation(
+                            pend["user_id"], pend["product_code"], txid
+                        )
                         del pending_payments[payment_id]
-                        # Marcar tx como procesada
                         processed_txids.add(txid)
                     else:
                         logger.warning(
                             f"⚠️ Pago con monto incorrecto para {payment_id}: recibido {amount_piconero}, esperado {expected_piconero}"
                         )
 
-                # Opcional: marcar tx como procesada aunque no coincida, para no repetir
-                # Pero mejor solo marcar si coincide o si ya no está pendiente.
-                # Si no coincide, no la marcamos, porque podría ser para otro producto futuro.
-                # Sin embargo, si ya fue procesada (coincidió) la marcamos.
-
-            # Limpiar set de txids procesados si crece demasiado
             if len(processed_txids) > 1000:
                 processed_txids = set(list(processed_txids)[-500:])
 
@@ -196,34 +204,70 @@ async def check_payments():
 
 
 async def send_payment_confirmation(user_id: int, product_code: str, txid: str):
-    """Envía mensaje de confirmación al usuario."""
-    # Necesitamos una referencia al bot para enviar mensajes.
-    # Usaremos la instancia global de telegram_app.
+    """
+    Envía confirmación de pago y genera/envía la factura en PDF.
+    """
     global telegram_app
     if telegram_app is None:
         logger.error("Telegram app no disponible para enviar confirmación")
         return
 
     try:
-        mensaje = (
+        # 1. Mensaje de pago recibido
+        mensaje_pago = (
             f"🎉 ¡Pago recibido!\n"
             f"Producto: *{product_code}*\n"
             f"ID de transacción: `{txid}`\n\n"
-            f"✅ Tu compra ha sido confirmada. ¡Gracias!"
+            f"⏳ Generando tu factura, por favor espera..."
         )
         await telegram_app.bot.send_message(
-            chat_id=user_id, text=mensaje, parse_mode=None
+            chat_id=user_id, text=mensaje_pago, parse_mode=None
         )
-        logger.info(f"Confirmación enviada al usuario {user_id}")
+        logger.info(f"Mensaje de pago enviado a usuario {user_id}")
+
+        # 2. Generar factura (PDF)
+        pdf_content = await generate_invoice(product_code)
+
+        # 3. Enviar PDF como documento
+        filename = f"{product_code}.pdf"
+        await telegram_app.bot.send_document(
+            chat_id=user_id,
+            document=pdf_content,
+            filename=filename,
+            caption=f"📄 Factura para {product_code}",
+        )
+        logger.info(f"Factura enviada a usuario {user_id} con archivo {filename}")
+
+        # 4. Mensaje final
+        mensaje_final = (
+            f"✅ Factura generada correctamente.\n"
+            f"Puedes descargarla desde el archivo adjunto.\n"
+            f"¡Gracias por tu compra!"
+        )
+        await telegram_app.bot.send_message(
+            chat_id=user_id, text=mensaje_final, parse_mode=None
+        )
+
     except Exception as e:
-        logger.error(f"Error enviando confirmación a {user_id}: {e}")
+        logger.error(
+            f"Error en send_payment_confirmation para usuario {user_id}: {e}",
+            exc_info=True,
+        )
+        # Notificar al usuario que hubo un problema con la factura
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=user_id,
+                text="❌ Ocurrió un error al generar tu factura. Por favor contacta a soporte.",
+            )
+        except Exception as e2:
+            logger.error(f"Error adicional al notificar fallo de factura: {e2}")
 
 
 # ---------- Handlers del bot ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Usuario {update.effective_user.id} ejecutó /start")
     await update.message.reply_text(
-        "¡Bienvenido! Por favor ingresa el código del producto (ejemplo: pantalon_00432)"
+        "¡Bienvenido! Por favor ingresa el código del producto (ejemplo: 111222333444)"
     )
 
 
@@ -239,19 +283,11 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Por favor ingresa un código válido.")
         return
 
-    # Simular validación del producto (para pruebas)
-    if "pantalon" not in product_code:
-        await update.message.reply_text(
-            "Código de producto no reconocido. Intenta con 'pantalon_XXXX'"
-        )
-        return
 
     try:
-        # Generar payment_id de 8 bytes (16 caracteres hex)
         payment_id = secrets.token_hex(8)
         logger.info(f"Generando dirección integrada con payment_id: {payment_id}")
 
-        # Llamar al wallet RPC
         resp = await rpc_call("make_integrated_address", {"payment_id": payment_id})
         if "error" in resp:
             logger.error(f"Error en make_integrated_address: {resp['error']}")
@@ -268,7 +304,6 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Guardar pago pendiente
         pending_payments[payment_id] = {
             "user_id": user_id,
             "product_code": product_code,
@@ -278,11 +313,8 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         logger.info(f"Pago pendiente agregado para {payment_id}")
 
-        # Formatear monto sin notación científica
-        # Ejemplo: 0.001 -> "0.001", 0.000000000001 -> "0.000000000001"
         amount_str = f"{PAYMENT_AMOUNT:.12f}".rstrip("0").rstrip(".")
 
-        # Construir mensaje con HTML para mejor visualización
         mensaje = (
             f"✅ Para completar la compra del producto <b>{product_code}</b>:\n\n"
             f"💰 <b>Monto a pagar:</b> <code>{amount_str}</code> XMR\n"
@@ -293,7 +325,6 @@ async def handle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\n💡 <i>Para copiar la dirección o el monto, haz tap largo sobre el texto y selecciona.</i>"
         )
 
-        # Enviar mensaje con parse_mode HTML
         await update.message.reply_text(
             mensaje,
             parse_mode="HTML",
@@ -329,7 +360,6 @@ async def lifespan(app: FastAPI):
 
     logger.info("🚀 Iniciando aplicación...")
 
-    # 1. Inicializar wallet
     try:
         await init_monero_wallet()
         logger.info("✅ Wallet Monero inicializada correctamente.")
@@ -337,12 +367,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Fallo crítico al iniciar la wallet: {e}")
         raise
 
-    # 2. Crear e inicializar la aplicación de telegram
     telegram_app = create_telegram_app()
     await telegram_app.initialize()
     logger.info("✅ Aplicación de Telegram inicializada.")
 
-    # 3. Configurar webhook
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(NGROK_URL)
@@ -370,15 +398,13 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Error configurando webhook: {e}")
         raise
 
-    # 4. Lanzar task de verificación de pagos
     asyncio.create_task(check_payments())
     logger.info(
         f"🔍 Task de verificación de pagos iniciado (intervalo {POLL_INTERVAL}s)"
     )
 
-    yield  # La aplicación está activa
+    yield
 
-    # Shutdown
     logger.info("🛑 Apagando aplicación...")
     if telegram_app:
         await telegram_app.shutdown()
